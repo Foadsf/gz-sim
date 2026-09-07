@@ -1,0 +1,40 @@
+[workspace]
+name = "gz-sim-windows-ci"
+description = "conda-forge toolchain and dependencies for building gz-sim from source on Windows"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+version = "0.1.0"
+
+# Qt6 needs to be told where its own plugins live before gz-gui can start, and
+# ctest launches GUI-linked binaries even in the headless suites.
+[target.win-64.activation.env]
+QT_QPA_PLATFORM_PLUGIN_PATH = "%CONDA_PREFIX%\\Library\\lib\\qt6\\plugins\\platforms"
+QML2_IMPORT_PATH = "%CONDA_PREFIX%\\Library\\lib\\qt6\\qml"
+
+# Version bounds track the gz_find_package() calls in the top-level
+# CMakeLists.txt for gz-sim10 (Jetty). Bump them together with that file,
+# never alone. conda-forge ships headers in the same package as the runtime,
+# so there is no separate -dev package to add.
+[dependencies]
+cmake = ">=3.22.1"
+ninja = "*"
+pkg-config = "*"
+libgz-cmake = "5.*"
+libgz-common = "7.*"
+libgz-fuel-tools = "11.*"
+libgz-gui = "10.*"
+libgz-math = "9.*"
+libgz-msgs = "12.*"
+libgz-physics = "9.*"
+libgz-plugin = "4.*"
+libgz-rendering = "10.*"
+libgz-sensors = "10.*"
+libgz-transport = "15.*"
+libgz-utils = "4.*"
+libsdformat = "16.*"
+# Provides the `gz` program, without which CMake silently skips the CLI tests.
+libgz-tools = "2.*"
+eigen = "*"
+libprotobuf = "*"
+qt6-main = ">=6.4"
+tinyxml2 = "*"
