@@ -1,5 +1,13 @@
 name: Jules on CI failure
 
+# The triggering branch has to be carried in the run's TITLE, because a
+# workflow_run listener's own `head_branch` is always the default branch --
+# measured 2026-09-07: run 34133053936 dispatched Jules for branch
+# windows-test-measurement-5153392590044617919 and was recorded under `main`.
+# The retry cap below counts runs by this title; filtering the runs API by
+# branch returns 0 forever and silently disables the cap.
+run-name: "jules-watch ${{ github.event.workflow_run.head_branch }}"
+
 # Asks Jules to investigate when a CI job this repository can actually
 # influence goes red, including on Jules' own PR branches, so that an open PR
 # can be driven to a green check instead of stalling on its first failure.
@@ -70,10 +78,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Count previous dispatches for this branch. A run of THIS workflow
-          # carries the triggering run's head_branch, so the branch filter is
-          # exact. `skipped` runs (guard said no) are excluded, otherwise a
-          # branch could exhaust its budget without Jules ever being called.
+          # Count previous invocations for this branch BY RUN TITLE (see the
+          # run-name comment at the top of this file). Filtering the runs API
+          # by branch does not work: a workflow_run listener's own head_branch
+          # is always the default branch, so the count would be 0 forever and
+          # the cap would never engage.
+          #
+          # A run that declined to dispatch is counted too. Declining is
+          # terminal -- the branch had no open PR, so no new commit lands and
+          # no new trigger occurs -- so conflating the two costs nothing real.
+          #
+          # Limitation, stated rather than hidden: this reads one page of the
+          # most recent runs across all branches. If this workflow accumulates
+          # more than 100 runs between two failures on the same branch, older
+          # entries fall out of the window and the cap under-counts. That errs
+          # toward dispatching, so raise per_page if this fork gets that busy.
+          #
           # No --paginate here or below: gh applies --jq per page, so an
           # aggregating filter like `| length` would print one number per page
           # and the numeric test below would fail on the multi-line value.
@@ -85,8 +105,8 @@ jobs:
           # 404 (e.g. after this file is renamed, so the runs endpoint no
           # longer resolves) is otherwise very hard to read in the log.
           if ! attempts=$(gh api -X GET "repos/$REPO/actions/workflows/jules-ci-failure.yml/runs" \
-            -f branch="$BRANCH" -f status=completed -f per_page=100 \
-            --jq '[.workflow_runs[] | select(.conclusion == "success")] | length'); then
+            -f status=completed -f per_page=100 \
+            --jq "[.workflow_runs[] | select(.conclusion == \"success\" and .display_title == \"jules-watch $BRANCH\")] | length"); then
             echo "::error::Could not read this workflow's own run history, so the retry cap cannot be enforced. Refusing to dispatch. If this file was renamed, update the path in the gh api call above."
             exit 1
           fi
