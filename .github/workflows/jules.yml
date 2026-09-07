@@ -1,0 +1,53 @@
+name: Jules
+
+# On-demand Jules task for this fork. Run it from Actions -> Jules -> Run workflow,
+# or with: gh workflow run jules.yml -f prompt="..." -f starting_branch=gz-sim10
+#
+# workflow_dispatch is restricted to users with write access to the repository,
+# so no extra author gating is needed here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'The task for Jules'
+        required: true
+        type: string
+      starting_branch:
+        description: 'Branch Jules starts from (it opens a PR back into this branch)'
+        required: true
+        default: 'gz-sim10'
+        type: string
+      include_commit_log:
+        description: 'Append the last 20 commits to the prompt'
+        required: false
+        default: false
+        type: boolean
+      include_last_commit:
+        description: 'Append the full diff of the last commit to the prompt'
+        required: false
+        default: false
+        type: boolean
+
+# The action only checks out the repo and POSTs to the Jules API; it never
+# pushes. Read is sufficient, which matters because this repository's default
+# workflow token permission is read.
+permissions:
+  contents: read
+
+jobs:
+  invoke:
+    name: Invoke Jules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Invoke Jules
+        # Pinned to the v1.0.0 commit. Note the published examples say
+        # `google-labs-code/jules-invoke@v1`; that repository was renamed to
+        # jules-action and no `v1` tag exists, so that reference cannot resolve.
+        uses: google-labs-code/jules-action@bff7875eaa123cac6742b7cfc51005b95ba4d566 # v1.0.0
+        with:
+          prompt: ${{ inputs.prompt }}
+          starting_branch: ${{ inputs.starting_branch }}
+          include_commit_log: ${{ inputs.include_commit_log }}
+          include_last_commit: ${{ inputs.include_last_commit }}
+          jules_api_key: ${{ secrets.JULES_API_KEY }}
