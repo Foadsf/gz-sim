@@ -18,16 +18,14 @@ on:
         required: true
         default: 'gz-sim10'
         type: string
-      include_commit_log:
-        description: 'Append the last 20 commits to the prompt'
-        required: false
-        default: false
-        type: boolean
-      include_last_commit:
-        description: 'Append the full diff of the last commit to the prompt'
-        required: false
-        default: false
-        type: boolean
+      # The action's include_last_commit / include_commit_log toggles are NOT
+      # exposed here, because they do not work. A composite action receives every
+      # input as a string, and the action gates those steps with
+      # `if: ${{ inputs.include_last_commit }}`; the string "false" is truthy in a
+      # GitHub expression, so both blocks are appended unconditionally.
+      # Measured 2026-09-07: a dispatch with both set to false still produced a
+      # payload containing a full `git show` and a 20-commit `git log --stat`.
+      # Put whatever you want Jules to see in the prompt itself.
 
 # The action only checks out the repo and POSTs to the Jules API; it never
 # pushes. Read is sufficient, which matters because this repository's default
@@ -48,6 +46,4 @@ jobs:
         with:
           prompt: ${{ inputs.prompt }}
           starting_branch: ${{ inputs.starting_branch }}
-          include_commit_log: ${{ inputs.include_commit_log }}
-          include_last_commit: ${{ inputs.include_last_commit }}
           jules_api_key: ${{ secrets.JULES_API_KEY }}
