@@ -1,0 +1,201 @@
+name: Jules on CI failure
+
+# Asks Jules to investigate when a CI job this repository can actually
+# influence goes red, including on Jules' own PR branches, so that an open PR
+# can be driven to a green check instead of stalling on its first failure.
+#
+# THIS FILE ONLY WORKS ON THE DEFAULT BRANCH. GitHub reads `workflow_run`
+# workflows from the default branch and nowhere else, so editing a copy of it
+# on a feature branch changes nothing.
+#
+# THREE THINGS KEEP THIS FROM RUNNING AWAY.
+#
+#  1. The watched-workflow list below. Bazel CI is deliberately NOT in it:
+#     as of 2026-09-07 it fails on upstream gazebosim/gz-sim main too
+#     (`no such target '@gz-sensors//:cpu_lidar'`), so nothing in this fork
+#     can fix it and every invocation would be wasted. `Ticket opened` and
+#     `PR Collection Labeler` are absent for the same reason -- they need
+#     gazebosim org secrets a fork cannot have. Both are disabled here
+#     anyway. Only add a workflow whose failures are fixable from this
+#     repository.
+#
+#  2. The attempt cap. Jules opens a PR, that PR runs CI, and if it fails the
+#     same trigger fires again. The previous version of this guard was a
+#     branch allowlist that excluded Jules' own `<name>-<19-digit-session-id>`
+#     branches outright, which was loop-safe but also meant Jules never fixed
+#     its own PRs -- the thing we actually want. The cap replaces it: count
+#     how many times this workflow has already dispatched for this branch and
+#     stop at MAX_ATTEMPTS. A wrong fix costs a bounded number of tasks
+#     instead of the day's quota.
+#
+#  3. The open-PR / release-branch requirement. A failure on some abandoned
+#     side branch is not worth a task.
+
+on:
+  workflow_run:
+    workflows:
+      - "Windows Test CI"
+      - "Windows CI"
+      - "Ubuntu CI"
+      - "Validate package.xml"
+    types: [completed]
+
+# One investigation at a time per branch.
+concurrency:
+  group: jules-ci-failure-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+env:
+  MAX_ATTEMPTS: 3
+
+jobs:
+  investigate:
+    name: Ask Jules to investigate
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether to dispatch
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Count previous dispatches for this branch. A run of THIS workflow
+          # carries the triggering run's head_branch, so the branch filter is
+          # exact. `skipped` runs (guard said no) are excluded, otherwise a
+          # branch could exhaust its budget without Jules ever being called.
+          # No --paginate here or below: gh applies --jq per page, so an
+          # aggregating filter like `| length` would print one number per page
+          # and the numeric test below would fail on the multi-line value.
+          # The API returns newest first, so one page of 100 is more than
+          # enough to find a cap of 3.
+          # `set -e` makes a failed query abort the step and dispatch nothing,
+          # which is the safe direction: never call Jules on an unknown
+          # attempt count. The explicit message is here because the bare gh
+          # 404 (e.g. after this file is renamed, so the runs endpoint no
+          # longer resolves) is otherwise very hard to read in the log.
+          if ! attempts=$(gh api -X GET "repos/$REPO/actions/workflows/jules-ci-failure.yml/runs" \
+            -f branch="$BRANCH" -f status=completed -f per_page=100 \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")] | length'); then
+            echo "::error::Could not read this workflow's own run history, so the retry cap cannot be enforced. Refusing to dispatch. If this file was renamed, update the path in the gh api call above."
+            exit 1
+          fi
+          echo "attempts=$attempts (max $MAX_ATTEMPTS)"
+
+          if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::warning::$BRANCH has already had $attempts Jules attempts; not dispatching again. Investigate by hand."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Only spend a task on a branch someone is actually waiting on: one
+          # with an open PR, or a release branch.
+          prs=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=100 \
+            --jq "[.[] | select(.head.ref == \"$BRANCH\")] | length")
+          case "$BRANCH" in
+            main|gz-sim[0-9]|gz-sim[0-9][0-9]) release_branch=true ;;
+            *) release_branch=false ;;
+          esac
+          echo "open PRs from this branch: $prs; release branch: $release_branch"
+
+          if [ "$prs" -eq 0 ] && [ "$release_branch" = "false" ]; then
+            echo "::notice::$BRANCH has no open PR and is not a release branch; not dispatching."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          echo "attempt=$((attempts + 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Invoke Jules
+        if: steps.guard.outputs.dispatch == 'true'
+        uses: google-labs-code/jules-action@bff7875eaa123cac6742b7cfc51005b95ba4d566 # v1.0.0
+        with:
+          starting_branch: ${{ github.event.workflow_run.head_branch }}
+          jules_api_key: ${{ secrets.JULES_API_KEY }}
+          prompt: |
+            Ground rules for this task — follow them exactly:
+            1. EVIDENCE. For every factual claim, quote the exact line you relied on with its
+               file path and line number, or the log line with its URL. If you cannot find it,
+               write NOT FOUND.
+            2. MEASURE AND JUDGE SEPARATELY. Report the measured value and your verdict as two
+               distinct fields. Never let the verdict stand in for the measurement.
+            3. DONE MEANS PROVEN. Do not report done until the CI run you depend on has
+               CONCLUDED. Paste real output, not a description of it. Do not end your turn
+               while a run you cited is still in progress.
+            4. UNCERTAINTY. End with everything you could not verify. An empty list is itself
+               a claim.
+            5. NO ENVIRONMENT SCRIPTS IN THE DELIVERABLE. Do not commit tooling bootstrap
+               files (installers, apt/curl setup scripts). They are not part of the change.
+
+            ## What happened
+
+            A CI workflow failed on this repository.
+
+            - Failed workflow: ${{ github.event.workflow_run.name }}
+            - Failed run:      ${{ github.event.workflow_run.html_url }}
+            - Branch:          ${{ github.event.workflow_run.head_branch }}
+            - Commit:          ${{ github.event.workflow_run.head_sha }}
+            - Attempt:         ${{ steps.guard.outputs.attempt }} of ${{ env.MAX_ATTEMPTS }}
+
+            This is attempt ${{ steps.guard.outputs.attempt }}. If earlier attempts on this
+            branch already tried a fix, read what they changed before proposing anything, and
+            say explicitly why the previous attempt did not work. Repeating a failed fix with
+            different wording is not progress. After attempt ${{ env.MAX_ATTEMPTS }} nothing
+            further is dispatched automatically, so if you are on the last attempt and are not
+            confident, a precise diagnosis is worth far more than another guess.
+
+            ## Verify the file you are about to rely on exists
+
+            A previous Jules task on this repository added a workflow that pointed
+            setup-pixi at `.github/ci/windows/pixi.toml` without ever creating that file, and
+            every run failed on a missing path before reaching a compiler. Before you finish:
+            for each path your change references — manifests, lockfiles, scripts, configs —
+            confirm it is present in the branch you are pushing, and quote the directory
+            listing that proves it.
+
+            ## Your environment, and what it means
+
+            You run on Linux. If this is a WINDOWS/MSVC failure you cannot reproduce it
+            locally, and you must not pretend otherwise. The only proof available to you is a
+            real GitHub Actions run, which happens when you open a PR.
+
+            Because of that, a careful diagnosis is worth more here than a fast patch.
+
+            ## Task
+
+            1. Read the failed run's logs and identify the failing step and the exact error.
+            2. Decide whether it is a genuine regression in this repository, an environment
+               problem (a dependency moved, a runner image changed, a flake), or a failure
+               inherited from upstream that this fork cannot fix. Say which, with evidence.
+               These need different responses and conflating them wastes everyone's time.
+               To test the third case, check whether the same job is failing the same way on
+               gazebosim/gz-sim, and quote the run you checked.
+            3. If, and only if, it is a genuine regression with a clear cause: implement the
+               minimal fix on a new branch, open a PR, WAIT for CI to conclude on it, and
+               paste the resulting summary line.
+            4. If the cause is not clear, or it looks environmental or inherited, DO NOT guess
+               at a patch. Open no PR. Report the diagnosis, quote the evidence, and stop. A
+               precise "here is what broke and why I cannot fix it blind" is a successful
+               outcome.
+
+            Never make CI green by disabling, skipping or excluding a test, and never by
+            loosening an assertion until it passes. If the honest answer is that the test now
+            fails legitimately, say so and leave it failing.
+
+            ## Reporting
+
+            Report as data, separately from your verdict: the failing step, the verbatim
+            error, the test summary line if the tests ran, and whether the cause is a
+            regression, environmental, or inherited from upstream. Then list what you could
+            not verify.
