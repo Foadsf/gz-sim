@@ -137,6 +137,58 @@ jobs:
           echo "dispatch=true" >> "$GITHUB_OUTPUT"
           echo "attempt=$((attempts + 1))" >> "$GITHUB_OUTPUT"
 
+      - name: Collect the failing log
+        id: log
+        if: steps.guard.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -uo pipefail
+
+          # Jules has NO authenticated GitHub API access. Measured 2026-09-07:
+          # session 4335597769314810284 stalled asking a human for the ctest
+          # output after 403/404 on the REST API, the gh CLI, the raw log URLs
+          # and HTML scraping. So the log has to travel inside the prompt --
+          # telling Jules to "read the failed run's logs" cannot work.
+          if ! gh run view "$RUN_ID" --repo "$REPO" --log-failed > /tmp/failed.log 2>/dev/null; then
+            echo "::warning::Could not download the failed log; dispatching without an excerpt."
+            : > /tmp/failed.log
+          fi
+
+          # Strip ANSI colour and the "job<TAB>step" columns gh prefixes.
+          sed -e 's/\x1b\[[0-9;]*m//g' -e 's/^[^\t]*\t[^\t]*\t//' /tmp/failed.log > /tmp/clean.log
+
+          # Anchor on the LAST line that names a failure, and take a window
+          # around it. A plain tail does NOT work: the end of a job log is
+          # post-job git-credential teardown, so a 200-line tail of the
+          # Windows run was almost entirely cleanup noise with the ctest
+          # summary barely inside it. Verified on two real logs of different
+          # shape -- a ctest run and a Bazel compile failure -- that this
+          # window contains the summary line, the failed-test list, and the
+          # originating error respectively.
+          anchor=$(grep -n -E '##\[error\]|tests passed,|The following tests FAILED|ERROR: |error: |FAILED:' /tmp/clean.log \
+            | tail -1 | cut -d: -f1)
+          if [ -z "${anchor:-}" ]; then
+            tail -n 200 /tmp/clean.log > /tmp/excerpt.txt
+          else
+            start=$(( anchor - 180 )); [ "$start" -lt 1 ] && start=1
+            sed -n "${start},$(( anchor + 15 ))p" /tmp/clean.log > /tmp/excerpt.txt
+          fi
+          tail -c 12000 /tmp/excerpt.txt > /tmp/excerpt.trim && mv /tmp/excerpt.trim /tmp/excerpt.txt
+
+          if [ ! -s /tmp/excerpt.txt ]; then
+            echo "(the log could not be retrieved by the workflow either)" > /tmp/excerpt.txt
+          fi
+          echo "excerpt: $(wc -l < /tmp/excerpt.txt) lines, $(wc -c < /tmp/excerpt.txt) bytes"
+
+          {
+            echo 'excerpt<<JULES_LOG_EOF'
+            cat /tmp/excerpt.txt
+            echo 'JULES_LOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Invoke Jules
         if: steps.guard.outputs.dispatch == 'true'
         uses: google-labs-code/jules-action@bff7875eaa123cac6742b7cfc51005b95ba4d566 # v1.0.0
@@ -184,6 +236,18 @@ jobs:
             confirm it is present in the branch you are pushing, and quote the directory
             listing that proves it.
 
+            ## The failing log
+
+            You have NO authenticated GitHub API access and cannot fetch this run's logs
+            yourself — the REST API, the gh CLI, the raw log URLs and HTML scraping all
+            return 403 or 404 for you. Do not spend turns trying. The tail of the failed
+            step is reproduced here verbatim:
+
+            ${{ steps.log.outputs.excerpt }}
+
+            If that excerpt is truncated or does not contain the cause, say so and ask for
+            the specific part you need. Do not guess at what the missing lines said.
+
             ## Your environment, and what it means
 
             You run on Linux. If this is a WINDOWS/MSVC failure you cannot reproduce it
@@ -194,7 +258,9 @@ jobs:
 
             ## Task
 
-            1. Read the failed run's logs and identify the failing step and the exact error.
+            1. From the log above, identify the failing step and the exact error. If several
+               distinct things failed, treat them as separate causes and group them by
+               evidence — do not invent one unifying explanation for all of them.
             2. Decide whether it is a genuine regression in this repository, an environment
                problem (a dependency moved, a runner image changed, a flake), or a failure
                inherited from upstream that this fork cannot fix. Say which, with evidence.
