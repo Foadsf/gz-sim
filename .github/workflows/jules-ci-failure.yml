@@ -38,6 +38,22 @@ run-name: "jules-watch ${{ github.event.workflow_run.head_branch }}"
 #
 #  3. The open-PR / release-branch requirement. A failure on some abandoned
 #     side branch is not worth a task.
+#
+#  4. Flakes are RE-RUN, not diagnosed. Measured 2026-09-07 on run
+#     34140541655: Ubuntu Resolute CI went red on a single timeout,
+#     `331 - INTEGRATION_triggered_camera (Timeout)`, with 352 of 353 tests
+#     passing, while upstream gazebosim/gz-sim main passed the same day.
+#     There was nothing to fix, and a Jules task was spent confirming that.
+#     So when the build SUCCEEDED and only the test phase failed, the failed
+#     jobs are re-run once first; Jules is called only if it fails again.
+#     A compile or configure failure is deterministic and goes straight to
+#     Jules without wasting a re-run.
+
+# NOTE on the `KeyError: 'disabled'` traceback from /junit_to_md.py that
+# appears in these logs: it is COSMETIC. gazebo-tooling/action-gz-ci runs that
+# script as `python3 /junit_to_md.py ... || true`, so it cannot fail the job;
+# the exit code comes from `make test`. Do not let a diagnosis treat it as a
+# cause. It is a real bug, but it belongs upstream in action-gz-ci.
 
 on:
   workflow_run:
@@ -55,7 +71,9 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
+  # write, not read: this workflow re-runs the failed jobs once before
+  # spending a Jules task (see point 4 above).
+  actions: write
   pull-requests: read
 
 env:
@@ -69,77 +87,8 @@ jobs:
       github.event.workflow_run.event != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Decide whether to dispatch
-        id: guard
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ github.event.workflow_run.head_branch }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          # Count previous invocations for this branch BY RUN TITLE (see the
-          # run-name comment at the top of this file). Filtering the runs API
-          # by branch does not work: a workflow_run listener's own head_branch
-          # is always the default branch, so the count would be 0 forever and
-          # the cap would never engage.
-          #
-          # A run that declined to dispatch is counted too. Declining is
-          # terminal -- the branch had no open PR, so no new commit lands and
-          # no new trigger occurs -- so conflating the two costs nothing real.
-          #
-          # Limitation, stated rather than hidden: this reads one page of the
-          # most recent runs across all branches. If this workflow accumulates
-          # more than 100 runs between two failures on the same branch, older
-          # entries fall out of the window and the cap under-counts. That errs
-          # toward dispatching, so raise per_page if this fork gets that busy.
-          #
-          # No --paginate here or below: gh applies --jq per page, so an
-          # aggregating filter like `| length` would print one number per page
-          # and the numeric test below would fail on the multi-line value.
-          # The API returns newest first, so one page of 100 is more than
-          # enough to find a cap of 3.
-          # `set -e` makes a failed query abort the step and dispatch nothing,
-          # which is the safe direction: never call Jules on an unknown
-          # attempt count. The explicit message is here because the bare gh
-          # 404 (e.g. after this file is renamed, so the runs endpoint no
-          # longer resolves) is otherwise very hard to read in the log.
-          if ! attempts=$(gh api -X GET "repos/$REPO/actions/workflows/jules-ci-failure.yml/runs" \
-            -f status=completed -f per_page=100 \
-            --jq "[.workflow_runs[] | select(.conclusion == \"success\" and .display_title == \"jules-watch $BRANCH\")] | length"); then
-            echo "::error::Could not read this workflow's own run history, so the retry cap cannot be enforced. Refusing to dispatch. If this file was renamed, update the path in the gh api call above."
-            exit 1
-          fi
-          echo "attempts=$attempts (max $MAX_ATTEMPTS)"
-
-          if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
-            echo "::warning::$BRANCH has already had $attempts Jules attempts; not dispatching again. Investigate by hand."
-            echo "dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Only spend a task on a branch someone is actually waiting on: one
-          # with an open PR, or a release branch.
-          prs=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=100 \
-            --jq "[.[] | select(.head.ref == \"$BRANCH\")] | length")
-          case "$BRANCH" in
-            main|gz-sim[0-9]|gz-sim[0-9][0-9]) release_branch=true ;;
-            *) release_branch=false ;;
-          esac
-          echo "open PRs from this branch: $prs; release branch: $release_branch"
-
-          if [ "$prs" -eq 0 ] && [ "$release_branch" = "false" ]; then
-            echo "::notice::$BRANCH has no open PR and is not a release branch; not dispatching."
-            echo "dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "dispatch=true" >> "$GITHUB_OUTPUT"
-          echo "attempt=$((attempts + 1))" >> "$GITHUB_OUTPUT"
-
       - name: Collect the failing log
         id: log
-        if: steps.guard.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -188,6 +137,98 @@ jobs:
             cat /tmp/excerpt.txt
             echo 'JULES_LOG_EOF'
           } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to dispatch
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # Count previous invocations for this branch BY RUN TITLE (see the
+          # run-name comment at the top of this file). Filtering the runs API
+          # by branch does not work: a workflow_run listener's own head_branch
+          # is always the default branch, so the count would be 0 forever and
+          # the cap would never engage.
+          #
+          # Every successful run of this workflow counts, including ones that
+          # declined to dispatch. For the no-open-PR decline that is harmless,
+          # because declining is terminal there: no new commit lands, so no
+          # new trigger occurs. For the flake re-run below it is NOT terminal,
+          # and the consequence is deliberate but worth stating plainly: the
+          # re-run consumes one unit of the budget, so a branch that starts
+          # with a flake gets MAX_ATTEMPTS-1 real Jules dispatches rather than
+          # MAX_ATTEMPTS, and the "Attempt N of M" line in the prompt counts
+          # that re-run as attempt 1. Erring toward fewer dispatches is the
+          # safe direction; raise MAX_ATTEMPTS if that proves too tight.
+          #
+          # Limitation, stated rather than hidden: this reads one page of the
+          # most recent runs across all branches. If this workflow accumulates
+          # more than 100 runs between two failures on the same branch, older
+          # entries fall out of the window and the cap under-counts. That errs
+          # toward dispatching, so raise per_page if this fork gets that busy.
+          #
+          # No --paginate here or below: gh applies --jq per page, so an
+          # aggregating filter like `| length` would print one number per page
+          # and the numeric test below would fail on the multi-line value.
+          # The API returns newest first, so one page of 100 is more than
+          # enough to find a cap of 3.
+          # `set -e` makes a failed query abort the step and dispatch nothing,
+          # which is the safe direction: never call Jules on an unknown
+          # attempt count. The explicit message is here because the bare gh
+          # 404 (e.g. after this file is renamed, so the runs endpoint no
+          # longer resolves) is otherwise very hard to read in the log.
+          if ! attempts=$(gh api -X GET "repos/$REPO/actions/workflows/jules-ci-failure.yml/runs" \
+            -f status=completed -f per_page=100 \
+            --jq "[.workflow_runs[] | select(.conclusion == \"success\" and .display_title == \"jules-watch $BRANCH\")] | length"); then
+            echo "::error::Could not read this workflow's own run history, so the retry cap cannot be enforced. Refusing to dispatch. If this file was renamed, update the path in the gh api call above."
+            exit 1
+          fi
+          echo "attempts=$attempts (max $MAX_ATTEMPTS)"
+
+          if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::warning::$BRANCH has already had $attempts Jules attempts; not dispatching again. Investigate by hand."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Only spend a task on a branch someone is actually waiting on: one
+          # with an open PR, or a release branch.
+          prs=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f per_page=100 \
+            --jq "[.[] | select(.head.ref == \"$BRANCH\")] | length")
+          case "$BRANCH" in
+            main|gz-sim[0-9]|gz-sim[0-9][0-9]) release_branch=true ;;
+            *) release_branch=false ;;
+          esac
+          echo "open PRs from this branch: $prs; release branch: $release_branch"
+
+          if [ "$prs" -eq 0 ] && [ "$release_branch" = "false" ]; then
+            echo "::notice::$BRANCH has no open PR and is not a release branch; not dispatching."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A flake is not worth a Jules task. If the build got as far as
+          # running tests -- so this is not a deterministic compile or
+          # configure error -- re-run the failed jobs once and stop. If the
+          # same failure comes back, the next invocation sees attempts>0 and
+          # goes to Jules. Measured on run 34140541655: 352 of 353 tests
+          # passed and the only failure was a timeout, while upstream was
+          # green; that cost a Jules task for a diagnosis of "flake".
+          if [ "$attempts" -eq 0 ] && grep -qE 'tests passed,|\(Timeout\)' /tmp/excerpt.txt; then
+            echo "::notice::Test-phase failure and no prior attempt on $BRANCH. Re-running the failed jobs once before spending a Jules task."
+            if gh run rerun "$RUN_ID" --repo "$REPO" --failed; then
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::Re-run could not be started; falling through to Jules."
+          fi
+
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          echo "attempt=$((attempts + 1))" >> "$GITHUB_OUTPUT"
 
       - name: Invoke Jules
         if: steps.guard.outputs.dispatch == 'true'
