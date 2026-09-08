@@ -132,10 +132,48 @@ jobs:
           fi
           echo "excerpt: $(wc -l < /tmp/excerpt.txt) lines, $(wc -c < /tmp/excerpt.txt) bytes"
 
+          # Second section: the individual assertion bodies. The window above
+          # names WHICH tests failed; these lines say WHY, and they live
+          # scattered through the middle of the log rather than next to the
+          # summary, so a single window can never contain both. gtest prints
+          # the assertion and then "[  FAILED  ] Name (N ms)", so a few lines
+          # of leading context per marker captures the file, the line number
+          # and expected-vs-actual.
+          #
+          # Measured 2026-09-07: without this, session 4335597769314810284
+          # could diagnose only 1 of 11 failing tests from run 34129526390 and
+          # reported "Unclear without further failure detail" for the rest.
+          grep -B 6 -E '\[  FAILED  \] .*\([0-9]+ ms\)' /tmp/clean.log 2>/dev/null \
+            > /tmp/details_full.txt || : > /tmp/details_full.txt
+
+          # Keep the whole detail section when it fits. Do NOT just tail it:
+          # measured on run 34129526390 the full section was 16090 bytes with
+          # 18 assertion lines, and a 10000-byte tail dropped 7 of them --
+          # including Server_TEST.cc, SystemLoader_TEST.cc and Util_TEST.cc,
+          # the three a Jules session was actually able to diagnose. When it
+          # genuinely does not fit, take from both ends rather than one, so
+          # the earliest failures survive alongside the latest.
+          if [ "$(wc -c < /tmp/details_full.txt)" -le 20000 ]; then
+            cp /tmp/details_full.txt /tmp/details.txt
+          else
+            head -c 12000 /tmp/details_full.txt  > /tmp/details.txt
+            echo ''                             >> /tmp/details.txt
+            echo '[... middle of the failure detail omitted for length ...]' >> /tmp/details.txt
+            echo ''                             >> /tmp/details.txt
+            tail -c 8000 /tmp/details_full.txt  >> /tmp/details.txt
+          fi
+          if [ ! -s /tmp/details.txt ]; then
+            echo "(no per-test assertion output found in this log)" > /tmp/details.txt
+          fi
+          echo "details: $(wc -c < /tmp/details.txt) bytes"
+
           {
             echo 'excerpt<<JULES_LOG_EOF'
             cat /tmp/excerpt.txt
             echo 'JULES_LOG_EOF'
+            echo 'details<<JULES_DETAIL_EOF'
+            cat /tmp/details.txt
+            echo 'JULES_DETAIL_EOF'
           } >> "$GITHUB_OUTPUT"
 
       - name: Decide whether to dispatch
@@ -288,6 +326,19 @@ jobs:
 
             If that excerpt is truncated or does not contain the cause, say so and ask for
             the specific part you need. Do not guess at what the missing lines said.
+
+            ## Per-test failure detail
+
+            The section above names WHICH tests failed. These are the assertion bodies
+            saying WHY — file, line number, and expected versus actual. Use them: a verdict
+            of "unclear without further failure detail" is only acceptable for a test that
+            does not appear here.
+
+            ${{ steps.log.outputs.details }}
+
+            Note that a job can also fail with output that never reaches a test assertion —
+            a SEGFAULT or a timeout produces no gtest body. For those, say so explicitly
+            rather than treating the absence as a missing log.
 
             ## Your environment, and what it means
 
