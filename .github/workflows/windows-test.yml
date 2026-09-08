@@ -39,13 +39,15 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release ^
               -DBUILD_DOCS=OFF ^
               -DSKIP_SWIG=ON ^
-              -DBUILD_TESTING=ON
+              -DBUILD_TESTING=ON ^
+              -DCMAKE_INSTALL_PREFIX="%GITHUB_WORKSPACE%\install"
 
       - name: Build
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
           pixi run --manifest-path .github/ci/windows/pixi.toml cmake --build build --config Release
+          pixi run --manifest-path .github/ci/windows/pixi.toml cmake --install build --config Release
 
       - name: Upload configure and build logs on failure
         if: failure()
@@ -61,4 +63,6 @@ jobs:
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          set "GZ_SIM_RESOURCE_PATH=%GITHUB_WORKSPACE%\install\share"
+          set "GZ_SIM_SYSTEM_PLUGIN_PATH=%GITHUB_WORKSPACE%\install\lib"
           pixi run --manifest-path .github/ci/windows/pixi.toml ctest --test-dir build -C Release --output-on-failure
